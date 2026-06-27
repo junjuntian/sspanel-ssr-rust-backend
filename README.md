@@ -64,14 +64,6 @@ cd sspanel-ssr-rust-backend
 bash install.sh
 ```
 
-非交互（CI/批量）可用环境变量预填：
-
-```bash
-PANEL_BASE_URL=https://example.com PANEL_KEY=xxx NODE_ID=62 \
-SERVER_PORT=558 REDIRECT_PORT=33033 ASSUME_YES=1 \
-bash install.sh
-```
-
 脚本幂等：重复执行只更新代码/配置，**不清空 iptables、不影响其他业务**。
 
 ## 常用运维
