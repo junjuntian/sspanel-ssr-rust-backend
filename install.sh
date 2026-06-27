@@ -375,6 +375,35 @@ EOF
   ok "journald 上限已设置"
 }
 
+# --- 7.5 启用 BBR 拥塞控制 (幂等; 内核不支持则跳过, 不影响安装) -----------
+enable_bbr() {
+  log "启用 BBR 拥塞控制 ..."
+  # 加载模块(内建进内核时 modprobe 也会静默成功)。
+  modprobe tcp_bbr 2>/dev/null || true
+  if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    warn "当前内核未提供 bbr (available: $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null))，跳过 BBR 启用。"
+    return 0
+  fi
+  # 开机自动加载模块。
+  echo 'tcp_bbr' > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+  # 持久化 sysctl(独立文件，便于回滚:删此文件 + sysctl --system 即恢复)。
+  local conf=/etc/sysctl.d/99-sspanel-bbr.conf
+  [ -f "$conf" ] && cp -a "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
+  cat > "$conf" <<'EOF'
+# >>> sspanel-ssr managed (BBR) >>>
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+# <<< sspanel-ssr managed (BBR) <<<
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+  local cur; cur="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  if [ "$cur" = "bbr" ]; then
+    ok "BBR 已启用 (tcp_congestion_control=bbr, default_qdisc=fq)"
+  else
+    warn "BBR 配置已写入，但当前算法仍为 '${cur}'；重启后生效。"
+  fi
+}
+
 # --- 8. 启动并校验 ---------------------------------------------------------
 start_and_verify() {
   log "启动 ${SERVICE_NAME} ..."
@@ -412,6 +441,7 @@ main() {
   install_service
   install_redirect
   cap_journald
+  enable_bbr
   start_and_verify
   echo
   ok "全部完成。"
