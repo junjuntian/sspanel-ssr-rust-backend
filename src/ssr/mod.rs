@@ -13,6 +13,7 @@
 //! own; the cipher and protocol layers carry all the logic.
 
 mod address;
+mod cipher;
 mod kdf;
 mod protocol;
 mod rc4;
@@ -24,9 +25,10 @@ use anyhow::{anyhow, Result};
 use crate::{config::NodeConfig, panel::PanelUser};
 
 pub use address::{pack_socket_addr, parse as parse_address, Address};
+pub use cipher::CipherKind;
 
+use cipher::StreamCipher;
 use protocol::AuthAes128Md5;
-use rc4::{Rc4Md5, IV_LEN, KEY_LEN};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
@@ -58,24 +60,34 @@ impl Profile {
     }
 
     pub fn ensure_supported(&self) -> Result<()> {
-        if self.method == "rc4-md5"
+        if (self.method == "rc4-md5" || self.method == "chacha20-ietf")
             && self.protocol == "auth_aes128_md5"
             && self.obfs == "plain"
         {
+            // Reuse the cipher mapping as the single source of truth for which
+            // methods are wired through the codec.
+            CipherKind::from_method(&self.method)?;
             return Ok(());
         }
         Err(anyhow!(
-            "unsupported SSR profile method={} protocol={} obfs={}; phase 1 only supports rc4-md5/auth_aes128_md5/plain",
+            "unsupported SSR profile method={} protocol={} obfs={}; only rc4-md5|chacha20-ietf / auth_aes128_md5 / plain are supported",
             self.method,
             self.protocol,
             self.obfs
         ))
     }
+
+    /// The stream cipher this profile's `method` selects.
+    pub fn cipher_kind(&self) -> CipherKind {
+        CipherKind::from_method(&self.method)
+            .expect("ensure_supported validated the method at construction")
+    }
 }
 
-/// Derive the connection master key from a password (`EVP_BytesToKey`, 16 bytes).
-pub fn derive_master_key(password: &str) -> Vec<u8> {
-    kdf::evp_bytes_to_key(password.as_bytes(), KEY_LEN)
+/// Derive the connection master key from a password (`EVP_BytesToKey`), sized for
+/// the selected cipher (16 bytes for rc4-md5, 32 for chacha20-ietf).
+pub fn derive_master_key(password: &str, cipher: CipherKind) -> Vec<u8> {
+    kdf::evp_bytes_to_key(password.as_bytes(), cipher.key_len())
 }
 
 pub fn derive_user_auth_key(password: &str) -> Vec<u8> {
@@ -90,13 +102,15 @@ pub fn udp_decrypt_packet(
     users: &HashMap<u64, Vec<u8>>,
     is_multi_user: i64,
     packet: &[u8],
+    cipher: CipherKind,
 ) -> Result<(Vec<u8>, Option<u64>)> {
-    if packet.len() < IV_LEN {
-        return Err(anyhow!("udp datagram shorter than the {IV_LEN}-byte IV"));
+    let iv_len = cipher.iv_len();
+    if packet.len() < iv_len {
+        return Err(anyhow!("udp datagram shorter than the {iv_len}-byte IV"));
     }
-    let iv = &packet[..IV_LEN];
-    let mut body = packet[IV_LEN..].to_vec();
-    Rc4Md5::new(master_key, iv).process(&mut body);
+    let iv = &packet[..iv_len];
+    let mut body = packet[iv_len..].to_vec();
+    cipher.new_stream(master_key, iv).process(&mut body);
     protocol::udp_server_post_decrypt(master_key, users, is_multi_user, iv, &body)
 }
 
@@ -114,13 +128,15 @@ pub fn udp_encrypt_packet(
     master_key: &[u8],
     proto_key: &[u8],
     header_and_payload: &[u8],
+    cipher: CipherKind,
 ) -> Result<Vec<u8>> {
     let data = protocol::udp_server_pre_encrypt(proto_key, header_and_payload);
-    let mut iv = [0_u8; IV_LEN];
+    let iv_len = cipher.iv_len();
+    let mut iv = vec![0_u8; iv_len];
     getrandom::getrandom(&mut iv).map_err(|err| anyhow!("failed to gather random IV: {err}"))?;
     let mut body = data;
-    Rc4Md5::new(master_key, &iv).process(&mut body);
-    let mut out = Vec::with_capacity(IV_LEN + body.len());
+    cipher.new_stream(master_key, &iv).process(&mut body);
+    let mut out = Vec::with_capacity(iv_len + body.len());
     out.extend_from_slice(&iv);
     out.extend_from_slice(&body);
     Ok(out)
@@ -133,18 +149,19 @@ pub fn udp_encrypt_packet(
 /// yields application payload. Wrap outbound payload with
 /// [`ServerSession::encrypt`], which prepends this direction's IV on first use.
 pub struct ServerSession {
+    cipher: CipherKind,
     master_key: Vec<u8>,
 
     // Receive side.
     recv_iv_buf: Vec<u8>,
-    decryptor: Option<Rc4Md5>,
+    decryptor: Option<StreamCipher>,
     protocol: Option<AuthAes128Md5>,
     users: Arc<HashMap<u64, Vec<u8>>>,
     is_multi_user: i64,
 
     // Send side.
-    send_iv: [u8; IV_LEN],
-    encryptor: Rc4Md5,
+    send_iv: Vec<u8>,
+    encryptor: StreamCipher,
     send_iv_emitted: bool,
 }
 
@@ -153,15 +170,17 @@ impl ServerSession {
         password: &str,
         users: Arc<HashMap<u64, Vec<u8>>>,
         is_multi_user: i64,
+        cipher: CipherKind,
     ) -> Result<Self> {
-        let master_key = kdf::evp_bytes_to_key(password.as_bytes(), KEY_LEN);
-        let mut send_iv = [0_u8; IV_LEN];
+        let master_key = kdf::evp_bytes_to_key(password.as_bytes(), cipher.key_len());
+        let mut send_iv = vec![0_u8; cipher.iv_len()];
         getrandom::getrandom(&mut send_iv)
             .map_err(|err| anyhow!("failed to gather random IV: {err}"))?;
-        let encryptor = Rc4Md5::new(&master_key, &send_iv);
+        let encryptor = cipher.new_stream(&master_key, &send_iv);
         Ok(Self {
+            cipher,
             master_key,
-            recv_iv_buf: Vec::with_capacity(IV_LEN),
+            recv_iv_buf: Vec::with_capacity(cipher.iv_len()),
             decryptor: None,
             protocol: None,
             users,
@@ -178,15 +197,16 @@ impl ServerSession {
         let mut cipher_bytes: Vec<u8>;
 
         if self.decryptor.is_none() {
+            let iv_len = self.cipher.iv_len();
             self.recv_iv_buf.extend_from_slice(raw);
-            if self.recv_iv_buf.len() < IV_LEN {
+            if self.recv_iv_buf.len() < iv_len {
                 return Ok(Vec::new());
             }
-            let iv: Vec<u8> = self.recv_iv_buf[..IV_LEN].to_vec();
-            let rest: Vec<u8> = self.recv_iv_buf[IV_LEN..].to_vec();
+            let iv: Vec<u8> = self.recv_iv_buf[..iv_len].to_vec();
+            let rest: Vec<u8> = self.recv_iv_buf[iv_len..].to_vec();
             self.recv_iv_buf = Vec::new();
 
-            self.decryptor = Some(Rc4Md5::new(&self.master_key, &iv));
+            self.decryptor = Some(self.cipher.new_stream(&self.master_key, &iv));
             self.protocol = Some(AuthAes128Md5::new(
                 self.master_key.clone(),
                 iv,
@@ -229,7 +249,7 @@ impl ServerSession {
             Ok(body)
         } else {
             self.send_iv_emitted = true;
-            let mut out = Vec::with_capacity(IV_LEN + body.len());
+            let mut out = Vec::with_capacity(self.send_iv.len() + body.len());
             out.extend_from_slice(&self.send_iv);
             out.extend_from_slice(&body);
             Ok(out)
@@ -246,15 +266,17 @@ mod tests {
     }
 
     // Mirror of the client send path, used only to drive the server codec in
-    // tests. Built straight from the same reference as the server side.
+    // tests. Built straight from the same reference as the server side, and
+    // parameterized by cipher so both rc4-md5 and chacha20-ietf are exercised.
     struct ClientCodec {
+        kind: CipherKind,
         master_key: Vec<u8>,
-        send_iv: [u8; IV_LEN],
-        encryptor: Rc4Md5,
+        send_iv: Vec<u8>,
+        encryptor: StreamCipher,
         sent_header: bool,
         pack_id: u32,
         recv_iv_buf: Vec<u8>,
-        decryptor: Option<Rc4Md5>,
+        decryptor: Option<StreamCipher>,
         recv_id: u32,
         user_key: Vec<u8>,
         recv_buf: Vec<u8>,
@@ -262,10 +284,15 @@ mod tests {
 
     impl ClientCodec {
         fn new(password: &str) -> Self {
-            let master_key = kdf::evp_bytes_to_key(password.as_bytes(), KEY_LEN);
-            let send_iv = [0x42_u8; IV_LEN];
-            let encryptor = Rc4Md5::new(&master_key, &send_iv);
+            Self::new_kind(password, CipherKind::Rc4Md5)
+        }
+
+        fn new_kind(password: &str, kind: CipherKind) -> Self {
+            let master_key = kdf::evp_bytes_to_key(password.as_bytes(), kind.key_len());
+            let send_iv = vec![0x42_u8; kind.iv_len()];
+            let encryptor = kind.new_stream(&master_key, &send_iv);
             Self {
+                kind,
                 user_key: master_key.clone(),
                 master_key,
                 send_iv,
@@ -280,10 +307,20 @@ mod tests {
         }
 
         fn new_multi(carrier_password: &str, user_id: u32, user_password: &str) -> Self {
-            let master_key = kdf::evp_bytes_to_key(carrier_password.as_bytes(), KEY_LEN);
-            let send_iv = [0x42_u8; IV_LEN];
-            let encryptor = Rc4Md5::new(&master_key, &send_iv);
+            Self::new_multi_kind(carrier_password, user_id, user_password, CipherKind::Rc4Md5)
+        }
+
+        fn new_multi_kind(
+            carrier_password: &str,
+            user_id: u32,
+            user_password: &str,
+            kind: CipherKind,
+        ) -> Self {
+            let master_key = kdf::evp_bytes_to_key(carrier_password.as_bytes(), kind.key_len());
+            let send_iv = vec![0x42_u8; kind.iv_len()];
+            let encryptor = kind.new_stream(&master_key, &send_iv);
             Self {
+                kind,
                 user_key: derive_user_auth_key(user_password),
                 master_key,
                 send_iv,
@@ -399,15 +436,16 @@ mod tests {
 
         // Decode server->client bytes back to plaintext.
         fn client_recv(&mut self, raw: &[u8]) -> Vec<u8> {
+            let iv_len = self.kind.iv_len();
             let mut cipher_bytes;
             if self.decryptor.is_none() {
                 self.recv_iv_buf.extend_from_slice(raw);
-                if self.recv_iv_buf.len() < IV_LEN {
+                if self.recv_iv_buf.len() < iv_len {
                     return Vec::new();
                 }
-                let iv = self.recv_iv_buf[..IV_LEN].to_vec();
-                let rest = self.recv_iv_buf[IV_LEN..].to_vec();
-                self.decryptor = Some(Rc4Md5::new(&self.master_key, &iv));
+                let iv = self.recv_iv_buf[..iv_len].to_vec();
+                let rest = self.recv_iv_buf[iv_len..].to_vec();
+                self.decryptor = Some(self.kind.new_stream(&self.master_key, &iv));
                 cipher_bytes = rest;
             } else {
                 cipher_bytes = raw.to_vec();
@@ -436,7 +474,7 @@ mod tests {
     fn handshake_and_relay_roundtrip() {
         let password = "correct horse battery staple";
         let mut client = ClientCodec::new(password);
-        let mut server = ServerSession::new(password, empty_users(), 0).unwrap();
+        let mut server = ServerSession::new(password, empty_users(), 0, CipherKind::Rc4Md5).unwrap();
 
         // Client sends an address header + initial payload in the first packet.
         let mut first_payload = vec![0x01, 93, 184, 216, 34, 0x01, 0xbb]; // 93.184.216.34:443
@@ -465,7 +503,7 @@ mod tests {
     fn decrypt_handles_split_iv() {
         let password = "splitiv";
         let mut client = ClientCodec::new(password);
-        let mut server = ServerSession::new(password, empty_users(), 0).unwrap();
+        let mut server = ServerSession::new(password, empty_users(), 0, CipherKind::Rc4Md5).unwrap();
         let payload = {
             let mut p = vec![0x01, 1, 1, 1, 1, 0x00, 0x50];
             p.extend_from_slice(b"data");
@@ -482,8 +520,10 @@ mod tests {
 
     #[test]
     fn udp_roundtrip() {
+        let kind = CipherKind::Rc4Md5;
+        let iv_len = kind.iv_len();
         let pw = "udp-secret";
-        let mkey = derive_master_key(pw);
+        let mkey = derive_master_key(pw, kind);
 
         // Client builds a datagram for 8.8.8.8:53 with payload "ping".
         let mut plain = vec![0x01, 8, 8, 8, 8, 0x00, 0x35];
@@ -491,14 +531,14 @@ mod tests {
         plain.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // uid (ignored by server)
         let mac = kdf::hmac_md5_prefix(&mkey, &plain, 4);
         plain.extend_from_slice(&mac);
-        let iv = [9_u8; IV_LEN];
+        let iv = vec![9_u8; iv_len];
         let mut body = plain.clone();
-        Rc4Md5::new(&mkey, &iv).process(&mut body);
-        let mut wire = iv.to_vec();
+        kind.new_stream(&mkey, &iv).process(&mut body);
+        let mut wire = iv.clone();
         wire.extend_from_slice(&body);
 
         // Server decodes -> address + payload.
-        let (decoded, uid) = udp_decrypt_packet(&mkey, &HashMap::new(), 0, &wire).unwrap();
+        let (decoded, uid) = udp_decrypt_packet(&mkey, &HashMap::new(), 0, &wire, kind).unwrap();
         assert_eq!(uid, None);
         let (addr, consumed) = parse_address(&decoded).unwrap().unwrap();
         assert_eq!(addr.host, "8.8.8.8");
@@ -508,12 +548,12 @@ mod tests {
         // Server encodes a response from 8.8.8.8:53.
         let mut hp = pack_socket_addr("8.8.8.8".parse().unwrap(), 53);
         hp.extend_from_slice(b"pong");
-        let pkt = udp_encrypt_packet(&mkey, &mkey, &hp).unwrap();
+        let pkt = udp_encrypt_packet(&mkey, &mkey, &hp, kind).unwrap();
 
         // Client decrypts the response.
-        let civ = &pkt[..IV_LEN];
-        let mut cbody = pkt[IV_LEN..].to_vec();
-        Rc4Md5::new(&mkey, civ).process(&mut cbody);
+        let civ = &pkt[..iv_len];
+        let mut cbody = pkt[iv_len..].to_vec();
+        kind.new_stream(&mkey, civ).process(&mut cbody);
         let n = cbody.len();
         assert_eq!(kdf::hmac_md5_prefix(&mkey, &cbody[..n - 4], 4), cbody[n - 4..]);
         let resp_plain = &cbody[..n - 4];
@@ -524,25 +564,26 @@ mod tests {
 
     #[test]
     fn udp_wrong_password_fails() {
-        let mkey = derive_master_key("right");
+        let kind = CipherKind::Rc4Md5;
+        let mkey = derive_master_key("right", kind);
         let mut plain = vec![0x01, 1, 1, 1, 1, 0x00, 0x35, b'x'];
         plain.extend_from_slice(&[0; 4]);
         let mac = kdf::hmac_md5_prefix(&mkey, &plain, 4);
         plain.extend_from_slice(&mac);
-        let iv = [3_u8; IV_LEN];
+        let iv = vec![3_u8; kind.iv_len()];
         let mut body = plain.clone();
-        Rc4Md5::new(&mkey, &iv).process(&mut body);
-        let mut wire = iv.to_vec();
+        kind.new_stream(&mkey, &iv).process(&mut body);
+        let mut wire = iv.clone();
         wire.extend_from_slice(&body);
 
-        let wrong = derive_master_key("wrong");
-        assert!(udp_decrypt_packet(&wrong, &HashMap::new(), 0, &wire).is_err());
+        let wrong = derive_master_key("wrong", kind);
+        assert!(udp_decrypt_packet(&wrong, &HashMap::new(), 0, &wire, kind).is_err());
     }
 
     #[test]
     fn wrong_password_fails() {
         let mut client = ClientCodec::new("right");
-        let mut server = ServerSession::new("wrong", empty_users(), 0).unwrap();
+        let mut server = ServerSession::new("wrong", empty_users(), 0, CipherKind::Rc4Md5).unwrap();
         let payload = vec![0x01, 1, 1, 1, 1, 0x00, 0x50, b'x'];
         let wire = client.client_first_send(&payload);
         assert!(server.decrypt(&wire).is_err());
@@ -557,7 +598,8 @@ mod tests {
         users.insert(user_id as u64, derive_user_auth_key(user_password));
 
         let mut client = ClientCodec::new_multi(carrier_password, user_id, user_password);
-        let mut server = ServerSession::new(carrier_password, Arc::new(users), 2).unwrap();
+        let mut server =
+            ServerSession::new(carrier_password, Arc::new(users), 2, CipherKind::Rc4Md5).unwrap();
         let payload = vec![0x01, 1, 1, 1, 1, 0x00, 0x50, b'x'];
         let wire = client.client_first_send(&payload);
         let decoded = server.decrypt(&wire).unwrap();
@@ -567,7 +609,9 @@ mod tests {
 
     #[test]
     fn multi_user_udp_identifies_uid() {
-        let carrier_key = derive_master_key("carrier");
+        let kind = CipherKind::Rc4Md5;
+        let iv_len = kind.iv_len();
+        let carrier_key = derive_master_key("carrier", kind);
         let user_id = 77_u32;
         let user_password = "udp-real-user";
         let user_key = derive_user_auth_key(user_password);
@@ -580,28 +624,28 @@ mod tests {
         let mac = kdf::hmac_md5_prefix(&user_key, &plain, 4);
         plain.extend_from_slice(&mac);
 
-        let iv = [5_u8; IV_LEN];
+        let iv = vec![5_u8; iv_len];
         let mut body = plain;
-        Rc4Md5::new(&carrier_key, &iv).process(&mut body);
-        let mut wire = iv.to_vec();
+        kind.new_stream(&carrier_key, &iv).process(&mut body);
+        let mut wire = iv.clone();
         wire.extend_from_slice(&body);
 
-        let (decoded, uid) = udp_decrypt_packet(&carrier_key, &users, 2, &wire).unwrap();
+        let (decoded, uid) = udp_decrypt_packet(&carrier_key, &users, 2, &wire, kind).unwrap();
         assert_eq!(uid, Some(user_id as u64));
         let (addr, consumed) = parse_address(&decoded).unwrap().unwrap();
         assert_eq!(addr.host, "8.8.4.4");
         assert_eq!(&decoded[consumed..], b"query");
 
-        // Server -> client response: rc4 keyed by the carrier key, but the
+        // Server -> client response: cipher keyed by the carrier key, but the
         // protocol HMAC keyed by the authenticated user's key. The client
         // verifies with its own user_key, so signing with the carrier key would
         // be rejected.
         let mut hp = pack_socket_addr("8.8.4.4".parse().unwrap(), 53);
         hp.extend_from_slice(b"answer");
-        let pkt = udp_encrypt_packet(&carrier_key, &user_key, &hp).unwrap();
-        let civ = &pkt[..IV_LEN];
-        let mut cbody = pkt[IV_LEN..].to_vec();
-        Rc4Md5::new(&carrier_key, civ).process(&mut cbody);
+        let pkt = udp_encrypt_packet(&carrier_key, &user_key, &hp, kind).unwrap();
+        let civ = &pkt[..iv_len];
+        let mut cbody = pkt[iv_len..].to_vec();
+        kind.new_stream(&carrier_key, civ).process(&mut cbody);
         let n = cbody.len();
         // HMAC must validate under the user's key, not the carrier key.
         assert_eq!(
@@ -616,5 +660,104 @@ mod tests {
         let (raddr, rconsumed) = parse_address(resp_plain).unwrap().unwrap();
         assert_eq!(raddr.host, "8.8.4.4");
         assert_eq!(&resp_plain[rconsumed..], b"answer");
+    }
+
+    // --- chacha20-ietf: same protocol layer, different stream cipher. ---
+
+    #[test]
+    fn chacha20_handshake_and_relay_roundtrip() {
+        let password = "chacha secret password";
+        let mut client = ClientCodec::new_kind(password, CipherKind::Chacha20Ietf);
+        let mut server =
+            ServerSession::new(password, empty_users(), 0, CipherKind::Chacha20Ietf).unwrap();
+
+        let mut first_payload = vec![0x01, 93, 184, 216, 34, 0x01, 0xbb];
+        first_payload.extend_from_slice(b"hello target");
+        let wire = client.client_first_send(&first_payload);
+        let decoded = server.decrypt(&wire).unwrap();
+        assert_eq!(decoded, first_payload);
+
+        let more = client.client_send(b"second chunk");
+        assert_eq!(server.decrypt(&more).unwrap(), b"second chunk");
+
+        let reply = server.encrypt(b"response bytes").unwrap();
+        assert_eq!(client.client_recv(&reply), b"response bytes");
+        let reply2 = server.encrypt(b"more response").unwrap();
+        assert_eq!(client.client_recv(&reply2), b"more response");
+    }
+
+    #[test]
+    fn chacha20_decrypt_handles_split_iv() {
+        // chacha20-ietf has a 12-byte IV; ensure byte-by-byte feeding still works.
+        let password = "chacha-splitiv";
+        let mut client = ClientCodec::new_kind(password, CipherKind::Chacha20Ietf);
+        let mut server =
+            ServerSession::new(password, empty_users(), 0, CipherKind::Chacha20Ietf).unwrap();
+        let payload = {
+            let mut p = vec![0x01, 1, 1, 1, 1, 0x00, 0x50];
+            p.extend_from_slice(b"data");
+            p
+        };
+        let wire = client.client_first_send(&payload);
+        let mut out = Vec::new();
+        for byte in &wire {
+            out.extend(server.decrypt(&[*byte]).unwrap());
+        }
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn chacha20_multi_user_tcp_identifies_uid() {
+        let carrier_password = "chacha-carrier";
+        let user_id = 42_u32;
+        let user_password = "real-user-password";
+        let mut users = HashMap::new();
+        users.insert(user_id as u64, derive_user_auth_key(user_password));
+
+        let mut client =
+            ClientCodec::new_multi_kind(carrier_password, user_id, user_password, CipherKind::Chacha20Ietf);
+        let mut server =
+            ServerSession::new(carrier_password, Arc::new(users), 2, CipherKind::Chacha20Ietf).unwrap();
+        let payload = vec![0x01, 1, 1, 1, 1, 0x00, 0x50, b'x'];
+        let wire = client.client_first_send(&payload);
+        assert_eq!(server.decrypt(&wire).unwrap(), payload);
+        assert_eq!(server.user_id(), Some(user_id as u64));
+    }
+
+    #[test]
+    fn chacha20_udp_roundtrip() {
+        let kind = CipherKind::Chacha20Ietf;
+        let iv_len = kind.iv_len();
+        let mkey = derive_master_key("chacha-udp", kind);
+
+        let mut plain = vec![0x01, 8, 8, 8, 8, 0x00, 0x35];
+        plain.extend_from_slice(b"ping");
+        plain.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // uid (ignored)
+        let mac = kdf::hmac_md5_prefix(&mkey, &plain, 4);
+        plain.extend_from_slice(&mac);
+        let iv = vec![9_u8; iv_len];
+        let mut body = plain.clone();
+        kind.new_stream(&mkey, &iv).process(&mut body);
+        let mut wire = iv.clone();
+        wire.extend_from_slice(&body);
+
+        let (decoded, uid) = udp_decrypt_packet(&mkey, &HashMap::new(), 0, &wire, kind).unwrap();
+        assert_eq!(uid, None);
+        let (addr, consumed) = parse_address(&decoded).unwrap().unwrap();
+        assert_eq!(addr.host, "8.8.8.8");
+        assert_eq!(&decoded[consumed..], b"ping");
+
+        let mut hp = pack_socket_addr("8.8.8.8".parse().unwrap(), 53);
+        hp.extend_from_slice(b"pong");
+        let pkt = udp_encrypt_packet(&mkey, &mkey, &hp, kind).unwrap();
+        let civ = &pkt[..iv_len];
+        let mut cbody = pkt[iv_len..].to_vec();
+        kind.new_stream(&mkey, civ).process(&mut cbody);
+        let n = cbody.len();
+        assert_eq!(kdf::hmac_md5_prefix(&mkey, &cbody[..n - 4], 4), cbody[n - 4..]);
+        let resp_plain = &cbody[..n - 4];
+        let (raddr, rconsumed) = parse_address(resp_plain).unwrap().unwrap();
+        assert_eq!(raddr.host, "8.8.8.8");
+        assert_eq!(&resp_plain[rconsumed..], b"pong");
     }
 }

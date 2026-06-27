@@ -43,7 +43,12 @@ impl Rc4 {
     }
 }
 
+// rc4-md5's fixed IV / key lengths. Now that the codec sizes IV/key via
+// `CipherKind`, these are referenced only by this module's own tests; kept as
+// documentation of the cipher's parameters.
+#[allow(dead_code)]
 pub const IV_LEN: usize = 16;
+#[allow(dead_code)]
 pub const KEY_LEN: usize = 16;
 
 /// One direction of an `rc4-md5` stream.

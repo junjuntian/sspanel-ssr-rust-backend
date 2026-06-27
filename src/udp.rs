@@ -12,7 +12,7 @@ use crate::{
     policy::{EnforcementConfig, UserPolicy},
     runtime::state::BoundedTtlMap,
     ssr,
-    ssr::{Address, Profile},
+    ssr::{Address, CipherKind, Profile},
     traffic::UserCounters,
 };
 
@@ -120,7 +120,8 @@ async fn run_listener(
 ) -> anyhow::Result<()> {
     let address = format!("{listen_host}:{port}");
     let socket = Arc::new(UdpSocket::bind(&address).await?);
-    let master_key = Arc::new(ssr::derive_master_key(&password));
+    let cipher_kind = profile.cipher_kind();
+    let master_key = Arc::new(ssr::derive_master_key(&password, cipher_kind));
     let mut associations =
         BoundedTtlMap::<AssociationKey, Association>::new(association_ttl, max_associations);
     let mut buffer = vec![0_u8; BUF_SIZE];
@@ -156,6 +157,7 @@ async fn run_listener(
                     &socket,
                     &counters_by_user,
                     is_multi_user,
+                    cipher_kind,
                     &mut associations,
                     max_associations,
                     &events,
@@ -184,13 +186,14 @@ async fn handle_inbound(
     server_socket: &Arc<UdpSocket>,
     counters_by_user: &Arc<HashMap<u64, Arc<UserCounters>>>,
     is_multi_user: i64,
+    cipher_kind: CipherKind,
     associations: &mut BoundedTtlMap<AssociationKey, Association>,
     max_associations: usize,
     events: &EventSender,
     rules: &RuleWatch,
 ) -> anyhow::Result<()> {
     let (plain, authenticated_user_id) =
-        ssr::udp_decrypt_packet(master_key, auth_users, is_multi_user, datagram)?;
+        ssr::udp_decrypt_packet(master_key, auth_users, is_multi_user, datagram, cipher_kind)?;
     let real_user_id = authenticated_user_id.unwrap_or(user_id);
     // The server->client response HMAC must be keyed by the authenticated user's
     // key (md5(password)) in single-port multi-user mode; in normal mode there is
@@ -264,6 +267,7 @@ async fn handle_inbound(
                 response_key,
                 counters,
                 peer,
+                cipher_kind,
             );
             associations.insert(association_key, Association { outbound: outbound.clone(), pump });
             outbound
@@ -331,6 +335,7 @@ fn spawn_response_pump(
     response_key: Arc<Vec<u8>>,
     counters: Arc<UserCounters>,
     peer: SocketAddr,
+    cipher_kind: CipherKind,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0_u8; BUF_SIZE];
@@ -341,7 +346,7 @@ fn spawn_response_pump(
             };
             let mut header = ssr::pack_socket_addr(from.ip(), from.port());
             header.extend_from_slice(&buf[..n]);
-            match ssr::udp_encrypt_packet(&master_key, &response_key, &header) {
+            match ssr::udp_encrypt_packet(&master_key, &response_key, &header, cipher_kind) {
                 Ok(pkt) => {
                     counters.record_download(pkt.len() as u64);
                     if server_socket.send_to(&pkt, peer).await.is_err() {

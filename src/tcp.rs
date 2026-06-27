@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     audit::{ConnectionAuditor, EventSender, RuleWatch},
     policy::{EnforcementConfig, UserPolicy},
-    ssr::{self, Address, Profile, ServerSession},
+    ssr::{self, Address, CipherKind, Profile, ServerSession},
     traffic::{ConnGuard, RateLimiter, UserCounters},
 };
 
@@ -38,6 +38,7 @@ struct StreamContext {
     policies: Arc<HashMap<u64, Arc<UserPolicy>>>,
     enforcement: EnforcementConfig,
     is_multi_user: i64,
+    cipher_kind: CipherKind,
     events: EventSender,
     rules: RuleWatch,
     peer_ip: String,
@@ -130,6 +131,7 @@ async fn run_listener(
     let address = format!("{listen_host}:{port}");
     let listener = TcpListener::bind(&address).await?;
     let permits = Arc::new(Semaphore::new(max_accepts));
+    let cipher_kind = profile.cipher_kind();
     info!(
         user_id,
         port,
@@ -173,6 +175,7 @@ async fn run_listener(
                         policies,
                         enforcement,
                         is_multi_user,
+                        cipher_kind,
                         events,
                         rules,
                         peer_ip: peer.ip().to_string(),
@@ -199,6 +202,7 @@ async fn handle_stream(
         &context.password,
         context.auth_users.clone(),
         context.is_multi_user,
+        context.cipher_kind,
     )?;
     let (mut client_read, mut client_write) = stream.into_split();
 

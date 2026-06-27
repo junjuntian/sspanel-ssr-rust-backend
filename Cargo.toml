@@ -16,9 +16,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # SSR codec crypto. RustCrypto crates, pure Rust (no OpenSSL), to keep the
 # musl/static build simple. RC4 is hand-rolled (trivial + avoids an unmaintained
-# crate); MD5/AES-128-CBC/HMAC come from RustCrypto.
+# crate); MD5/AES-128-CBC/HMAC come from RustCrypto. ChaCha20 (IETF variant:
+# 32-byte key, 12-byte nonce) backs the chacha20-ietf method.
 md-5 = "0.10"
 aes = "0.8"
+chacha20 = "0.9"
 cbc = { version = "0.1", features = ["alloc"] }
 hmac = "0.12"
 base64 = "0.22"
