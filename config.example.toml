@@ -1,0 +1,47 @@
+# Copy to /etc/sspanel-ssr-rust-backend/config.toml.
+# Keep this project local; the remote VPS is only a deployment target for the
+# compiled binary and config.
+
+[panel]
+base_url = "https://panel.example.com"
+key = ""
+node_id = 1
+request_timeout_secs = 10
+poll_interval_secs = 60
+traffic_report_interval_secs = 60
+heartbeat_interval_secs = 60
+# Force IPv4 egress for webapi requests so the panel's checkNodeIp matches the
+# node's IPv4 server field. Leave true unless the node is registered by IPv6.
+ipv4_only = true
+
+[node]
+listen_host = "0.0.0.0"
+method = "rc4-md5"
+protocol = "auth_aes128_md5"
+obfs = "plain"
+server_port = 43003
+timeout_secs = 300
+workers = 1
+tcp_enabled = true
+udp_enabled = true
+# 节点侧管控开关(均默认 true)。设为 false 即为对应功能的"无感"逃生开关：
+#   enforce_forbidden  — 执行每用户 forbidden_ip / forbidden_port 阻断
+#   enforce_conn_limit — 执行每用户 node_connector 并发连接数上限
+#   audit_block        — detect 规则命中时断开连接(false 则仅上报不断开)
+#   enforce_speed      — 执行每用户 node_speedlimit (Mbit/s) 限速
+enforce_forbidden = true
+enforce_conn_limit = true
+audit_block = true
+enforce_speed = true
+
+[limits]
+max_users = 4096
+max_sessions = 65536
+session_ttl_secs = 600
+max_udp_associations = 32768
+udp_association_ttl_secs = 180
+max_alive_ips = 65536
+alive_ip_ttl_secs = 600
+max_detect_logs = 8192
+detect_log_ttl_secs = 3600
+max_accepts_per_port = 2048

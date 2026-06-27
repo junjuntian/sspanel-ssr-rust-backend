@@ -1,0 +1,6 @@
+/target/
+*.log
+config.local.toml
+# Real runtime config holds the panel muKey secret — never commit it.
+config.toml
+config.toml.bak.*
