@@ -3,11 +3,14 @@
 # sspanel-ssr-rust-backend 一键安装/对接脚本 (A 层)
 #
 # 在一台全新机器上执行本脚本即可：
-#   1) 安装构建依赖 (git / curl / gcc) 与 Rust 工具链(若缺失)
+#   1) 安装构建依赖 (git / curl / gcc / jq) 与 Rust 工具链(若缺失)
 #   2) 拉取本项目 GitHub 源码并本地编译出 release 二进制
-#   3) 交互式录入 面板域名 / muKey / 节点ID，生成 config.toml
-#   4) 安装 systemd 服务托管(保活) + 可选 33033->本端口 NAT 重定向
-#   5) 给 journald 设置磁盘上限(替代 logrotate)，启动并对接面板
+#   3) 交互式录入 面板域名 / muKey / 节点ID(只此 3 项)，生成 config.toml
+#   4) 自动从面板节点列表(GET /mod_mu/nodes)读取本节点 server 字段，
+#      解析出 监听端口(port=NN) 与 对外端口(#MM)，无需手动输入端口
+#   5) 安装 systemd 服务托管(保活) + 对外端口->监听端口 NAT 重定向
+#      (单端口多用户策略必须重定向，否则客户端连不上)
+#   6) 给 journald 设置磁盘上限(替代 logrotate)，启动并对接面板
 #
 # 复跑安全(幂等)：重复执行只会更新代码/配置，不会清空 iptables，不动其他业务。
 #
@@ -17,7 +20,8 @@
 #   git clone https://github.com/junjuntian/sspanel-ssr-rust-backend.git && cd sspanel-ssr-rust-backend && bash install.sh
 #
 # 可用环境变量覆盖默认值(非交互场景)：
-#   REPO_URL  PANEL_BASE_URL  PANEL_KEY  NODE_ID  SERVER_PORT  REDIRECT_PORT  ASSUME_YES=1
+#   REPO_URL  PANEL_BASE_URL  PANEL_KEY  NODE_ID  ASSUME_YES=1
+#   (端口默认自动从面板读取；如需强制可另传 SERVER_PORT / REDIRECT_PORT 覆盖)
 # ---------------------------------------------------------------------------
 set -Eeuo pipefail
 
@@ -55,14 +59,14 @@ install_build_deps() {
     apt)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y
-      apt-get install -y git curl ca-certificates gcc make pkg-config iptables
+      apt-get install -y git curl ca-certificates gcc make pkg-config iptables jq
       ;;
     dnf)
-      dnf install -y git curl ca-certificates gcc make pkgconf-pkg-config iptables || \
+      dnf install -y git curl ca-certificates gcc make pkgconf-pkg-config iptables jq || \
       dnf groupinstall -y "Development Tools"
       ;;
     yum)
-      yum install -y git curl ca-certificates gcc make pkgconfig iptables || \
+      yum install -y git curl ca-certificates gcc make pkgconfig iptables jq || \
       yum groupinstall -y "Development Tools"
       ;;
     *)
@@ -118,18 +122,49 @@ prompt() {  # prompt VAR "提示" "默认值"
   printf -v "$__var" '%s' "${__in:-$__def}"
 }
 
+# 从面板节点列表自动解析监听端口/对外端口（只用 域名/muKey/节点ID 三项）。
+# 面板 server 字段格式: "IP[;server=域名][|;]port=<监听>#<对外>"
+#   node 62 示例:  172.236.156.205;port=558#33033  -> 监听 558, 对外 33033
+derive_ports() {
+  # 已用环境变量显式指定端口则不覆盖
+  if [ -n "${SERVER_PORT:-}" ] && [ -n "${REDIRECT_PORT:-}" ]; then
+    log "使用环境变量指定的端口: 监听=${SERVER_PORT} 对外=${REDIRECT_PORT}"
+    return 0
+  fi
+  log "从面板节点列表读取端口 (GET ${PANEL_BASE_URL}/mod_mu/nodes) ..."
+  local json server p_listen p_out
+  json="$(curl -4 -fsS --max-time 15 "${PANEL_BASE_URL}/mod_mu/nodes?key=${PANEL_KEY}" 2>/dev/null || true)"
+  [ -n "$json" ] || { err "无法读取面板节点列表，请检查 面板域名/muKey/网络 是否正确。"; exit 1; }
+  server="$(printf '%s' "$json" | jq -r --arg id "${NODE_ID}" '.data[]? | select((.id|tostring)==$id) | .server' 2>/dev/null | head -1)"
+  [ -n "$server" ] && [ "$server" != "null" ] || {
+    err "节点列表里找不到 node_id=${NODE_ID}（请核对 节点ID 是否属于该 muKey）。"; exit 1; }
+  log "节点 ${NODE_ID} 的 server 字段: ${server}"
+  p_listen="$(printf '%s' "$server" | grep -oE 'port=[0-9]+'  | head -1 | cut -d= -f2)"
+  p_out="$(printf '%s'   "$server" | grep -oE '#[0-9]+'        | head -1 | tr -d '#')"
+  [ -n "$p_listen" ] || { err "无法从 server 字段解析监听端口(port=NN): ${server}"; exit 1; }
+  SERVER_PORT="${SERVER_PORT:-$p_listen}"
+  REDIRECT_PORT="${REDIRECT_PORT:-$p_out}"
+  if [ -n "${REDIRECT_PORT}" ]; then
+    ok "解析得到: 监听端口=${SERVER_PORT}  对外端口=${REDIRECT_PORT}  (将自动配置 ${REDIRECT_PORT}->${SERVER_PORT} NAT 重定向)"
+  else
+    warn "server 字段只解析到监听端口=${SERVER_PORT}，未发现对外端口(#MM)，跳过 NAT 重定向。"
+    warn "若该节点为单端口多用户且客户端连不上，请确认面板节点端口配置为 port=<监听>#<对外>。"
+  fi
+}
+
 configure() {
   echo
-  log "===== 录入面板对接信息 ====="
+  log "===== 录入面板对接信息 (只需 3 项) ====="
   prompt PANEL_BASE_URL "面板域名/地址 (例: https://panel.example.com)" ""
   prompt PANEL_KEY      "面板 muKey" ""
   prompt NODE_ID        "节点 ID" ""
-  prompt SERVER_PORT    "本节点监听端口 (面板里该节点的端口)" "558"
-  prompt REDIRECT_PORT  "对外端口->监听端口 NAT 重定向(留空=不做重定向)" ""
 
   [ -n "${PANEL_BASE_URL}" ] || { err "面板域名不能为空"; exit 1; }
   [ -n "${PANEL_KEY}" ]      || { err "muKey 不能为空"; exit 1; }
   [ -n "${NODE_ID}" ]        || { err "节点 ID 不能为空"; exit 1; }
+  PANEL_BASE_URL="${PANEL_BASE_URL%/}"   # 去掉结尾斜杠
+
+  derive_ports
 
   local cfg="${INSTALL_DIR}/config.toml"
   if [ -f "$cfg" ]; then cp -a "$cfg" "${cfg}.bak.$(date +%Y%m%d%H%M%S)"; fi
