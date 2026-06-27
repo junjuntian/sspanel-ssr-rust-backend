@@ -1,11 +1,12 @@
 //! ShadowsocksR data-plane codec.
 //!
-//! Phase 1 supports exactly one profile: `method=rc4-md5`,
-//! `protocol=auth_aes128_md5`, `obfs=plain`. The layers compose, on the server
-//! receive path, as:
+//! Supported profile: `method` is one of `rc4-md5` or `chacha20-ietf`
+//! (chosen per carrier port from its `method` field), with
+//! `protocol=auth_aes128_md5` and `obfs=plain`. The layers compose, on the
+//! server receive path, as:
 //!
 //! ```text
-//! tcp bytes -> obfs(plain, passthrough) -> rc4-md5 decrypt -> auth_aes128_md5
+//! tcp bytes -> obfs(plain, passthrough) -> stream-cipher decrypt -> auth_aes128_md5
 //!           -> SOCKS5 address header + application payload
 //! ```
 //!

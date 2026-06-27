@@ -1,0 +1,78 @@
+name: release-build
+
+# 在 GitHub 上编译出 x86_64 musl 静态二进制并发布到 Release，
+# 这样节点执行 install.sh 时可直接下载预编译产物，无需在机器上跑 cargo（秒装）。
+#
+# 触发方式：
+#   * 推送 tag（v*）：用该 tag 名创建/更新 Release。
+#   * 手动 workflow_dispatch：填入 tag 名，在当前 commit 上创建该 tag 的 Release。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create/update (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+  BIN: sspanel-ssr-rust-backend
+
+jobs:
+  build-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain + musl target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${TARGET}"
+
+      - name: Install musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run tests (host)
+        run: cargo test --locked
+
+      - name: Build release (musl, static)
+        run: cargo build --locked --release --target "${TARGET}"
+
+      - name: Stage artifacts (binary + sha256)
+        run: |
+          mkdir -p dist
+          cp "target/${TARGET}/release/${BIN}" "dist/${BIN}-${TARGET}"
+          ( cd dist && sha256sum "${BIN}-${TARGET}" > "${BIN}-${TARGET}.sha256" )
+          ls -l dist
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          files: |
+            dist/${{ env.BIN }}-${{ env.TARGET }}
+            dist/${{ env.BIN }}-${{ env.TARGET }}.sha256

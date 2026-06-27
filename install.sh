@@ -3,8 +3,9 @@
 # sspanel-ssr-rust-backend 一键安装/对接脚本 (A 层)
 #
 # 在一台全新机器上执行本脚本即可：
-#   1) 安装构建依赖 (git / curl / gcc / jq) 与 Rust 工具链(若缺失)
-#   2) 拉取本项目 GitHub 源码并本地编译出 release 二进制
+#   1) 安装基础依赖 (git / curl / jq / iptables)
+#   2) 拉取源码并【优先下载 GitHub Releases 的预编译二进制 (musl 静态, 秒装)】;
+#      下载失败或 BUILD_FROM_SOURCE=1 时, 自动安装 Rust 工具链回退本地编译
 #   3) 交互式录入 面板域名 / muKey / 节点ID(只此 3 项)，生成 config.toml
 #   4) 自动从面板节点列表(GET /mod_mu/nodes)读取本节点 server 字段，
 #      解析出 监听端口(port=NN) 与 对外端口(#MM)，无需手动输入端口
@@ -22,10 +23,16 @@
 # 可用环境变量覆盖默认值(非交互场景)：
 #   REPO_URL  PANEL_BASE_URL  PANEL_KEY  NODE_ID  ASSUME_YES=1
 #   (端口默认自动从面板读取；如需强制可另传 SERVER_PORT / REDIRECT_PORT 覆盖)
+#   BUILD_FROM_SOURCE=1  强制本地编译, 不下载预编译二进制
+#   RELEASE_TAG=v0.1.0   指定下载的 Release 版本(默认 latest)
 # ---------------------------------------------------------------------------
 set -Eeuo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/junjuntian/sspanel-ssr-rust-backend.git}"
+REPO_SLUG="${REPO_SLUG:-junjuntian/sspanel-ssr-rust-backend}"   # 用于拼 Releases 下载地址
+RELEASE_TAG="${RELEASE_TAG:-latest}"                            # latest 或具体 tag (如 v0.1.0)
+ASSET_TARGET="${ASSET_TARGET:-x86_64-unknown-linux-musl}"       # 预编译产物的目标三元组
+BUILD_FROM_SOURCE="${BUILD_FROM_SOURCE:-0}"                     # 1 = 跳过预编译下载, 强制本地编译
 INSTALL_DIR="${INSTALL_DIR:-/root/sspanel-ssr-rust-backend}"
 SERVICE_NAME="sspanel-ssr-rust-backend"
 SYSTEMD_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -52,28 +59,43 @@ detect_pkg_mgr() {
   else echo unknown; fi
 }
 
-install_build_deps() {
+# 基础依赖：无论是否本地编译都需要 (拉源码 / 下载二进制 / 解析面板 / NAT)。
+install_base_deps() {
   local mgr; mgr="$(detect_pkg_mgr)"
-  log "安装构建依赖 (包管理器: ${mgr}) ..."
+  log "安装基础依赖 (包管理器: ${mgr}) ..."
   case "$mgr" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y
-      apt-get install -y git curl ca-certificates gcc make pkg-config iptables jq
+      apt-get install -y git curl ca-certificates iptables jq
+      ;;
+    dnf) dnf install -y git curl ca-certificates iptables jq || true ;;
+    yum) yum install -y git curl ca-certificates iptables jq || true ;;
+    *)   warn "未识别的包管理器，跳过依赖安装。请自行确保 git/curl/jq 已就绪。" ;;
+  esac
+  ok "基础依赖就绪"
+}
+
+# 编译器依赖：仅在需要本地编译(回退路径)时安装。
+install_compiler_deps() {
+  local mgr; mgr="$(detect_pkg_mgr)"
+  log "安装编译器依赖 (包管理器: ${mgr}) ..."
+  case "$mgr" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get install -y gcc make pkg-config
       ;;
     dnf)
-      dnf install -y git curl ca-certificates gcc make pkgconf-pkg-config iptables jq || \
-      dnf groupinstall -y "Development Tools"
+      dnf install -y gcc make pkgconf-pkg-config || dnf groupinstall -y "Development Tools"
       ;;
     yum)
-      yum install -y git curl ca-certificates gcc make pkgconfig iptables jq || \
-      yum groupinstall -y "Development Tools"
+      yum install -y gcc make pkgconfig || yum groupinstall -y "Development Tools"
       ;;
     *)
-      warn "未识别的包管理器，跳过依赖安装。请自行确保 git/curl/gcc 已就绪。"
+      warn "未识别的包管理器，跳过编译器依赖。请自行确保 gcc/make 已就绪。"
       ;;
   esac
-  ok "系统依赖就绪"
+  ok "编译器依赖就绪"
 }
 
 # --- 2. Rust 工具链 --------------------------------------------------------
@@ -91,26 +113,95 @@ ensure_rust() {
   ok "Rust 安装完成: $(cargo --version)"
 }
 
-# --- 3. 拉取源码 + 编译 ----------------------------------------------------
-fetch_and_build() {
+# --- 3a. 拉取源码 (确定 INSTALL_DIR; 提供 config 位置与编译回退) -----------
+fetch_source() {
   if [ -d "${INSTALL_DIR}/.git" ]; then
     log "更新已存在的仓库 ${INSTALL_DIR} ..."
     git -C "${INSTALL_DIR}" fetch --all --prune
     git -C "${INSTALL_DIR}" reset --hard origin/main
   elif [ -f "$(pwd)/Cargo.toml" ] && grep -q 'sspanel-ssr-rust-backend' "$(pwd)/Cargo.toml" 2>/dev/null; then
-    log "在当前源码目录就地构建：$(pwd)"
+    log "使用当前源码目录：$(pwd)"
     INSTALL_DIR="$(pwd)"
   else
     log "克隆 ${REPO_URL} -> ${INSTALL_DIR} ..."
     rm -rf "${INSTALL_DIR}"
     git clone "${REPO_URL}" "${INSTALL_DIR}"
   fi
+}
 
+# --- 3b. 优先下载 GitHub Releases 预编译二进制 (musl 静态, 任意 x86_64 可跑) -
+# 成功则把二进制放到 ${INSTALL_DIR}/target/release/ 并返回 0；否则返回 1 由调用方回退编译。
+try_download_prebuilt() {
+  local arch asset url_bin url_sha tmp_bin tmp_sha
+  arch="$(uname -m)"
+  if [ "$arch" != "x86_64" ]; then
+    warn "当前架构 ${arch} 无预编译产物(仅提供 x86_64)，将本地编译。"
+    return 1
+  fi
+  asset="${SERVICE_NAME}-${ASSET_TARGET}"
+  if [ "${RELEASE_TAG}" = "latest" ]; then
+    url_bin="https://github.com/${REPO_SLUG}/releases/latest/download/${asset}"
+  else
+    url_bin="https://github.com/${REPO_SLUG}/releases/download/${RELEASE_TAG}/${asset}"
+  fi
+  url_sha="${url_bin}.sha256"
+
+  tmp_bin="$(mktemp)"; tmp_sha="$(mktemp)"
+  log "尝试下载预编译二进制 (${RELEASE_TAG}): ${url_bin}"
+  if ! curl -fL --retry 3 --connect-timeout 15 -o "${tmp_bin}" "${url_bin}"; then
+    rm -f "${tmp_bin}" "${tmp_sha}"
+    warn "未找到预编译二进制(可能该版本尚未发布)。"
+    return 1
+  fi
+  # ELF 魔数校验，避免把 404 HTML 当成二进制。
+  if [ "$(head -c 4 "${tmp_bin}" | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]; then
+    rm -f "${tmp_bin}" "${tmp_sha}"
+    warn "下载内容不是 ELF 可执行文件，放弃预编译。"
+    return 1
+  fi
+  # sha256 校验（best-effort：有则必须通过，没有则告警继续）。
+  if curl -fL --retry 2 --connect-timeout 15 -o "${tmp_sha}" "${url_sha}" 2>/dev/null; then
+    local want got
+    want="$(awk '{print $1}' "${tmp_sha}" | head -1)"
+    got="$(sha256sum "${tmp_bin}" | awk '{print $1}')"
+    if [ -n "${want}" ] && [ "${want}" != "${got}" ]; then
+      err "预编译二进制 sha256 校验失败 (期望 ${want} 实际 ${got})，放弃预编译。"
+      rm -f "${tmp_bin}" "${tmp_sha}"
+      return 1
+    fi
+    ok "sha256 校验通过"
+  else
+    warn "未取到 .sha256 校验文件，跳过完整性校验。"
+  fi
+
+  mkdir -p "${INSTALL_DIR}/target/release"
+  install -m 0755 "${tmp_bin}" "${INSTALL_DIR}/target/release/${SERVICE_NAME}"
+  rm -f "${tmp_bin}" "${tmp_sha}"
+  return 0
+}
+
+# 本地编译回退路径。
+build_from_source() {
+  install_compiler_deps
+  ensure_rust
   log "本地编译 release 二进制 (首次干净编译约 5-10 分钟，视机器性能；之后增量很快) ..."
   ( cd "${INSTALL_DIR}" && cargo build --release )
+}
+
+# 取得二进制：优先预编译下载，失败/强制时本地编译。
+obtain_binary() {
   BIN_PATH="${INSTALL_DIR}/target/release/${SERVICE_NAME}"
-  [ -x "${BIN_PATH}" ] || { err "编译产物缺失: ${BIN_PATH}"; exit 1; }
-  ok "编译完成: ${BIN_PATH}"
+  if [ "${BUILD_FROM_SOURCE}" = "1" ]; then
+    log "BUILD_FROM_SOURCE=1，跳过预编译下载，直接本地编译。"
+    build_from_source
+  elif try_download_prebuilt; then
+    ok "已使用 GitHub 预编译二进制（跳过本地编译，秒装）。"
+  else
+    warn "回退到本地编译。"
+    build_from_source
+  fi
+  [ -x "${BIN_PATH}" ] || { err "二进制缺失: ${BIN_PATH}"; exit 1; }
+  ok "二进制就绪: ${BIN_PATH}"
 }
 
 # --- 4. 交互式录入并写 config.toml ----------------------------------------
@@ -314,9 +405,9 @@ start_and_verify() {
 }
 
 main() {
-  install_build_deps
-  ensure_rust
-  fetch_and_build
+  install_base_deps
+  fetch_source
+  obtain_binary
   configure
   install_service
   install_redirect
