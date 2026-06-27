@@ -102,7 +102,7 @@ fetch_and_build() {
     git clone "${REPO_URL}" "${INSTALL_DIR}"
   fi
 
-  log "本地编译 release 二进制 (首次约 1-3 分钟) ..."
+  log "本地编译 release 二进制 (首次干净编译约 5-10 分钟，视机器性能；之后增量很快) ..."
   ( cd "${INSTALL_DIR}" && cargo build --release )
   BIN_PATH="${INSTALL_DIR}/target/release/${SERVICE_NAME}"
   [ -x "${BIN_PATH}" ] || { err "编译产物缺失: ${BIN_PATH}"; exit 1; }
