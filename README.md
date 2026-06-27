@@ -7,14 +7,6 @@
 
 ## 支持的 profile
 
-当前聚焦一个明确的节点 profile（其余 method/protocol/obfs 组合在配置或用户同步时直接拒绝，不假装支持完整 SSR 矩阵）：
-
-```toml
-method   = "rc4-md5"
-protocol = "auth_aes128_md5"
-obfs     = "plain"
-```
-
 支持 **单端口多用户**：carrier 行（`is_multi_user != 0`）提供监听端口与外层
 password/method/protocol/obfs；普通用户行（`is_multi_user = 0`）组成鉴权表，
 `auth_aes128_md5` 头部里的 uid 识别真实用户，流量 / 在线IP / 审计日志按真实用户上报。
