@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{atomic::AtomicUsize, Arc},
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,7 +13,8 @@ use crate::{
     audit::{ConnectionAuditor, EventSender, RuleWatch},
     policy::{EnforcementConfig, UserPolicy},
     ssr::{self, Address, CipherKind, Profile, ServerSession},
-    traffic::{ConnGuard, RateLimiter, UserCounters},
+    traffic::ConnGuard,
+    user_tables::{UserTables, UserTablesWatch},
 };
 
 /// Max bytes pulled from a socket per read. Also caps how much app payload we
@@ -31,11 +27,11 @@ const MAX_HANDSHAKE_BYTES: usize = 64 * 1024;
 struct StreamContext {
     password: String,
     fallback_user_id: u64,
-    auth_users: Arc<HashMap<u64, Vec<u8>>>,
-    counters_by_user: Arc<HashMap<u64, Arc<UserCounters>>>,
-    conns_by_user: Arc<HashMap<u64, Arc<AtomicUsize>>>,
-    speeds_by_user: Arc<HashMap<u64, Arc<RateLimiter>>>,
-    policies: Arc<HashMap<u64, Arc<UserPolicy>>>,
+    /// Snapshot of the per-user tables taken at accept time. Cheap to clone
+    /// (Arc fields) and stable for the lifetime of this one connection, so a
+    /// later panel poll that swaps the published tables never affects an
+    /// in-flight session.
+    tables: Arc<UserTables>,
     enforcement: EnforcementConfig,
     is_multi_user: i64,
     cipher_kind: CipherKind,
@@ -67,11 +63,7 @@ pub fn spawn_user_listener(
     port: u16,
     password: String,
     profile: Profile,
-    auth_users: Arc<HashMap<u64, Vec<u8>>>,
-    counters_by_user: Arc<HashMap<u64, Arc<UserCounters>>>,
-    conns_by_user: Arc<HashMap<u64, Arc<AtomicUsize>>>,
-    speeds_by_user: Arc<HashMap<u64, Arc<RateLimiter>>>,
-    policies: Arc<HashMap<u64, Arc<UserPolicy>>>,
+    tables_rx: UserTablesWatch,
     enforcement: EnforcementConfig,
     is_multi_user: i64,
     max_accepts: usize,
@@ -86,11 +78,7 @@ pub fn spawn_user_listener(
             port,
             password,
             profile,
-            auth_users,
-            counters_by_user,
-            conns_by_user,
-            speeds_by_user,
-            policies,
+            tables_rx,
             enforcement,
             is_multi_user,
             max_accepts.max(1),
@@ -116,11 +104,7 @@ async fn run_listener(
     port: u16,
     password: String,
     profile: Profile,
-    auth_users: Arc<HashMap<u64, Vec<u8>>>,
-    counters_by_user: Arc<HashMap<u64, Arc<UserCounters>>>,
-    conns_by_user: Arc<HashMap<u64, Arc<AtomicUsize>>>,
-    speeds_by_user: Arc<HashMap<u64, Arc<RateLimiter>>>,
-    policies: Arc<HashMap<u64, Arc<UserPolicy>>>,
+    tables_rx: UserTablesWatch,
     enforcement: EnforcementConfig,
     is_multi_user: i64,
     max_accepts: usize,
@@ -154,11 +138,10 @@ async fn run_listener(
                     warn!(user_id, port, %peer, "tcp accept capacity reached; closing connection");
                     continue;
                 };
-                let auth_users = auth_users.clone();
-                let counters_by_user = counters_by_user.clone();
-                let conns_by_user = conns_by_user.clone();
-                let speeds_by_user = speeds_by_user.clone();
-                let policies = policies.clone();
+                // Snapshot the current per-user tables for this connection. Reading
+                // the watch synchronously here (no await held across the borrow)
+                // picks up the latest panel poll without any listener restart.
+                let tables = tables_rx.borrow().clone();
                 let password = password.clone();
                 let session_timeout = profile.timeout;
                 let events = events.clone();
@@ -168,11 +151,7 @@ async fn run_listener(
                     let context = StreamContext {
                         password,
                         fallback_user_id: user_id,
-                        auth_users,
-                        counters_by_user,
-                        conns_by_user,
-                        speeds_by_user,
-                        policies,
+                        tables,
                         enforcement,
                         is_multi_user,
                         cipher_kind,
@@ -200,7 +179,7 @@ async fn handle_stream(
     stream.set_nodelay(true).ok();
     let mut session = ServerSession::new(
         &context.password,
-        context.auth_users.clone(),
+        context.tables.auth_users.clone(),
         context.is_multi_user,
         context.cipher_kind,
     )?;
@@ -233,21 +212,21 @@ async fn handle_stream(
     };
 
     let user_id = session.user_id().unwrap_or(context.fallback_user_id);
-    let counters = context.counters_by_user
+    let counters = context.tables.counters_by_user
         .get(&user_id)
         .cloned()
-        .or_else(|| context.counters_by_user.get(&context.fallback_user_id).cloned())
+        .or_else(|| context.tables.counters_by_user.get(&context.fallback_user_id).cloned())
         .ok_or_else(|| anyhow::anyhow!("no traffic counter for authenticated user {user_id}"))?;
     counters.record_upload(pre_auth_upload);
 
     // Per-user enforcement policy (present only for users with active limits).
-    let policy = context.policies.get(&user_id).cloned();
+    let policy = context.tables.policies.get(&user_id).cloned();
 
     // node_speedlimit: shared per-user token bucket. `None` => unlimited (the
     // limiter is a no-op anyway when rate==0, but skipping the await avoids the
     // lock entirely on the hot path for unlimited users).
     let limiter = if context.enforcement.speed {
-        context.speeds_by_user.get(&user_id).cloned()
+        context.tables.speeds_by_user.get(&user_id).cloned()
     } else {
         None
     };
@@ -257,6 +236,7 @@ async fn handle_stream(
     let _conn_guard = match (&policy, context.enforcement.conn_limit) {
         (Some(policy), true) if policy.conn_limit > 0 => {
             let counter = context
+                .tables
                 .conns_by_user
                 .get(&user_id)
                 .cloned()
@@ -319,9 +299,16 @@ async fn handle_stream(
                 counters.record_upload(n as u64);
                 let data = session.decrypt(&from_client[..n])?;
                 if !data.is_empty() {
-                    if auditor.scan(&data) && context.enforcement.audit_block {
-                        anyhow::bail!("connection dropped: payload matched a detect rule");
-                    }
+                    // Detect rules are enforced ONLY on the handshake/initial
+                    // payload (target address + first request line / TLS SNI / BT
+                    // handshake), mirroring the original SSR audit intent. The
+                    // streaming body is deliberately NOT scanned or blocked here:
+                    // the panel rule set matches target domains / request
+                    // signatures, and applying it per-chunk to arbitrary upload
+                    // bytes produced false positives (e.g. the BT rule's
+                    // `tracker|seed|ratio|p2p` words appearing inside ordinary
+                    // file data) that broke normal uploads. First-packet blocking
+                    // above still stops BT handshakes and forbidden domains.
                     if let Some(l) = &limiter {
                         l.acquire(data.len()).await;
                     }

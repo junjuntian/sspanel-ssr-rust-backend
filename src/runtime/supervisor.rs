@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::Instant,
 };
@@ -20,18 +19,23 @@ use crate::{
     tcp::{self, TcpListenerTask},
     traffic::{ConnLedger, RateLimiter, SpeedLedger, TrafficLedger},
     udp::{self, UdpListenerTask},
+    user_tables::{UserTables, UserTablesTx},
 };
 
 use std::sync::atomic::AtomicUsize;
 
+/// Identity of a listener's *socket-level* configuration. Only a change here
+/// forces a listener teardown + rebind. Per-user data (auth keys, policies,
+/// counters, speed buckets) is intentionally **excluded**: it is hot-swapped via
+/// the `UserTables` watch channel, so adding/removing a user or changing a
+/// password/policy never restarts the listener (no disconnect, no UDP rebind
+/// race). For a single-port carrier this fingerprint is effectively constant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UserFingerprint {
     port: u16,
     password: String,
     profile: Profile,
     is_multi_user: i64,
-    auth_users_hash: u64,
-    policies_hash: u64,
 }
 
 struct ActiveUser {
@@ -70,41 +74,6 @@ struct SessionKey {
     peer: String,
 }
 
-fn hash_auth_users(users: &HashMap<u64, Vec<u8>>) -> u64 {
-    let mut ordered: Vec<_> = users.iter().collect();
-    ordered.sort_by_key(|(user_id, _)| **user_id);
-    let mut hasher = DefaultHasher::new();
-    for (user_id, key) in ordered {
-        user_id.hash(&mut hasher);
-        key.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Fingerprint hash of the per-user policies that the listener captures *at spawn
-/// time* and therefore can only pick up via a listener restart:
-/// `conn_limit`, `forbidden_ips`, `forbidden_ports`.
-///
-/// `speed_limit_bps` is deliberately excluded: the rate cap is applied through a
-/// persistent shared token bucket (`SpeedLedger`) whose rate is updated in place
-/// on every poll (`ensure_user` -> `set_rate`). Folding it into the fingerprint
-/// would needlessly rebuild the listener on every speed change — dropping the
-/// accept loop for *all* users on a single-port carrier — for a value that takes
-/// effect live without any restart. Keeping it out makes speed changes 无感.
-fn hash_policies(policies: &HashMap<u64, Arc<UserPolicy>>) -> u64 {
-    let mut ordered: Vec<_> = policies.iter().collect();
-    ordered.sort_by_key(|(user_id, _)| **user_id);
-    let mut hasher = DefaultHasher::new();
-    for (user_id, policy) in ordered {
-        user_id.hash(&mut hasher);
-        policy.conn_limit.hash(&mut hasher);
-        policy.forbidden_ips.hash(&mut hasher);
-        policy.forbidden_ports.hash(&mut hasher);
-        // speed_limit_bps intentionally omitted (applied live via SpeedLedger).
-    }
-    hasher.finish()
-}
-
 pub struct BackendRuntime {
     config: Config,
     panel: PanelClient,
@@ -124,12 +93,17 @@ pub struct BackendRuntime {
     /// Compiled detect rules, broadcast to every listener. Updated on each poll.
     detect_rules_tx: watch::Sender<RuleSet>,
     detect_rules_rx: RuleWatch,
+    /// Hot-swappable per-user lookup tables, republished on every poll. Listeners
+    /// subscribe and read the current snapshot per-accept/per-datagram, so user
+    /// changes apply live without a listener restart.
+    user_tables_tx: UserTablesTx,
 }
 
 impl BackendRuntime {
     pub fn new(config: Config, panel: PanelClient) -> Self {
         let (events_tx, events_rx) = audit::event_channel();
         let (detect_rules_tx, detect_rules_rx) = watch::channel(audit::empty_rules());
+        let (user_tables_tx, _) = watch::channel(Arc::new(UserTables::default()));
         Self {
             alive_ips: BoundedTtlMap::new(config.limits.alive_ip_ttl(), config.limits.max_alive_ips),
             sessions: BoundedTtlMap::new(config.limits.session_ttl(), config.limits.max_sessions),
@@ -148,6 +122,7 @@ impl BackendRuntime {
             events_rx: Some(events_rx),
             detect_rules_tx,
             detect_rules_rx,
+            user_tables_tx,
         }
     }
 
@@ -281,13 +256,19 @@ impl BackendRuntime {
             }
         }
 
-        let auth_users_hash = hash_auth_users(&auth_users);
-        let policies_hash = hash_policies(&policies);
-        let auth_users = Arc::new(auth_users);
-        let counters_by_user = Arc::new(counters_by_user);
-        let conns_by_user = Arc::new(conns_by_user);
-        let speeds_by_user = Arc::new(speeds_by_user);
-        let policies = Arc::new(policies);
+        // Publish the freshly built per-user tables so every running listener
+        // picks them up on its next accept/datagram — no restart, no disconnect.
+        // Done before (re)spawning listeners so a newly spawned listener's first
+        // `borrow()` already sees this snapshot.
+        let tables = Arc::new(UserTables {
+            auth_users: Arc::new(auth_users),
+            counters_by_user: Arc::new(counters_by_user),
+            conns_by_user: Arc::new(conns_by_user),
+            speeds_by_user: Arc::new(speeds_by_user),
+            policies: Arc::new(policies),
+        });
+        self.user_tables_tx.send_replace(tables);
+
         let listener_users: Vec<PanelUser> = if users.iter().any(|user| user.is_multi_user != 0) {
             merge_carrier_users(
                 users
@@ -313,18 +294,7 @@ impl BackendRuntime {
             };
             live_ports.insert(user.port);
 
-            self.ensure_active_user(
-                user,
-                profile,
-                auth_users.clone(),
-                counters_by_user.clone(),
-                conns_by_user.clone(),
-                speeds_by_user.clone(),
-                policies.clone(),
-                auth_users_hash,
-                policies_hash,
-            )
-            .await?;
+            self.ensure_active_user(user, profile).await?;
         }
 
         let stale_ports: Vec<u16> = self
@@ -349,27 +319,13 @@ impl BackendRuntime {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn ensure_active_user(
-        &mut self,
-        user: PanelUser,
-        profile: Profile,
-        auth_users: Arc<HashMap<u64, Vec<u8>>>,
-        counters_by_user: Arc<HashMap<u64, std::sync::Arc<crate::traffic::UserCounters>>>,
-        conns_by_user: Arc<HashMap<u64, Arc<AtomicUsize>>>,
-        speeds_by_user: Arc<HashMap<u64, Arc<RateLimiter>>>,
-        policies: Arc<HashMap<u64, Arc<UserPolicy>>>,
-        auth_users_hash: u64,
-        policies_hash: u64,
-    ) -> Result<()> {
+    async fn ensure_active_user(&mut self, user: PanelUser, profile: Profile) -> Result<()> {
         let user_id = user.user_id();
         let fingerprint = UserFingerprint {
             port: user.port,
             password: user.password.clone(),
             profile: profile.clone(),
             is_multi_user: user.is_multi_user,
-            auth_users_hash,
-            policies_hash,
         };
         if matches!(self.active_users.get(&user.port), Some(active) if active.fingerprint == fingerprint)
         {
@@ -394,11 +350,7 @@ impl BackendRuntime {
                 user.port,
                 user.password.clone(),
                 profile.clone(),
-                auth_users.clone(),
-                counters_by_user.clone(),
-                conns_by_user.clone(),
-                speeds_by_user.clone(),
-                policies.clone(),
+                self.user_tables_tx.subscribe(),
                 enforcement,
                 user.is_multi_user,
                 self.config.limits.max_accepts_per_port,
@@ -415,9 +367,7 @@ impl BackendRuntime {
                 user.port,
                 user.password.clone(),
                 profile,
-                auth_users,
-                counters_by_user,
-                policies,
+                self.user_tables_tx.subscribe(),
                 enforcement,
                 user.is_multi_user,
                 self.config.limits.udp_association_ttl(),
@@ -590,5 +540,51 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
         info!("received Ctrl-C");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn profile() -> Profile {
+        Profile::new(
+            "rc4-md5".into(),
+            "auth_aes128_md5".into(),
+            "plain".into(),
+            Duration::from_secs(300),
+        )
+        .unwrap()
+    }
+
+    fn fingerprint(port: u16, password: &str, is_multi_user: i64) -> UserFingerprint {
+        UserFingerprint {
+            port,
+            password: password.into(),
+            profile: profile(),
+            is_multi_user,
+        }
+    }
+
+    /// The fingerprint only carries socket-level config. A change to per-user
+    /// data (auth keys, policies, counters) does not — and cannot — appear here,
+    /// so two snapshots of the *same* carrier compare equal and the supervisor
+    /// keeps the listener running (no disconnect) while hot-swapping the tables.
+    #[test]
+    fn fingerprint_stable_across_user_changes() {
+        // Identical carrier config on two different polls -> equal -> no restart.
+        assert_eq!(fingerprint(558, "carrier", 2), fingerprint(558, "carrier", 2));
+    }
+
+    /// A genuine socket-level change (carrier port/password/multi-user mode) must
+    /// still flip the fingerprint and trigger a rebind — that's the only case a
+    /// restart is warranted.
+    #[test]
+    fn fingerprint_changes_on_socket_level_change() {
+        let base = fingerprint(558, "carrier", 2);
+        assert_ne!(base, fingerprint(559, "carrier", 2)); // port
+        assert_ne!(base, fingerprint(558, "rotated", 2)); // carrier password
+        assert_ne!(base, fingerprint(558, "carrier", 0)); // multi-user mode
     }
 }

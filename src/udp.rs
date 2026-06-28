@@ -14,6 +14,7 @@ use crate::{
     ssr,
     ssr::{Address, CipherKind, Profile},
     traffic::UserCounters,
+    user_tables::UserTablesWatch,
 };
 
 /// Max UDP datagram we will read. SSR datagrams are well under this.
@@ -60,9 +61,7 @@ pub fn spawn_user_listener(
     port: u16,
     password: String,
     profile: Profile,
-    auth_users: Arc<HashMap<u64, Vec<u8>>>,
-    counters_by_user: Arc<HashMap<u64, Arc<UserCounters>>>,
-    policies: Arc<HashMap<u64, Arc<UserPolicy>>>,
+    tables_rx: UserTablesWatch,
     enforcement: EnforcementConfig,
     is_multi_user: i64,
     association_ttl: Duration,
@@ -78,9 +77,7 @@ pub fn spawn_user_listener(
             port,
             password,
             profile,
-            auth_users,
-            counters_by_user,
-            policies,
+            tables_rx,
             enforcement,
             is_multi_user,
             association_ttl,
@@ -107,9 +104,7 @@ async fn run_listener(
     port: u16,
     password: String,
     profile: Profile,
-    auth_users: Arc<HashMap<u64, Vec<u8>>>,
-    counters_by_user: Arc<HashMap<u64, Arc<UserCounters>>>,
-    policies: Arc<HashMap<u64, Arc<UserPolicy>>>,
+    tables_rx: UserTablesWatch,
     enforcement: EnforcementConfig,
     is_multi_user: i64,
     association_ttl: Duration,
@@ -145,17 +140,22 @@ async fn run_listener(
                 let (size, peer) = received?;
                 associations.expire();
 
+                // Snapshot the current per-user tables for this datagram. Reading
+                // the watch synchronously here (borrow not held across an await)
+                // picks up the latest panel poll without any listener restart.
+                let tables = tables_rx.borrow().clone();
+
                 if let Err(err) = handle_inbound(
                     &buffer[..size],
                     peer,
                     user_id,
                     port,
                     &master_key,
-                    &auth_users,
-                    &policies,
+                    &tables.auth_users,
+                    &tables.policies,
                     enforcement,
                     &socket,
-                    &counters_by_user,
+                    &tables.counters_by_user,
                     is_multi_user,
                     cipher_kind,
                     &mut associations,
@@ -227,14 +227,15 @@ async fn handle_inbound(
         }
     }
 
-    // Audit the decrypted payload against detect rules (deduped downstream by the
-    // supervisor's detect-log map; try_send drops under pressure). When node-side
-    // audit blocking is on, a match drops the datagram before it is relayed.
+    // Audit the decrypted payload against detect rules for visibility (deduped
+    // downstream by the supervisor's detect-log map; try_send drops under
+    // pressure). Detection is recorded but deliberately NOT enforced on the UDP
+    // body: per-datagram regex blocking false-positived on ordinary upload bytes
+    // (e.g. QUIC/HTTP3 payloads matching the BT rule's `tracker|seed|ratio|p2p`
+    // words), dropping packets and breaking normal transfers. Forbidden
+    // ip/port enforcement above is unaffected.
     let ip = peer.ip().to_string();
-    let matched = audit::scan_payload(&rules.borrow(), events, real_user_id, &ip, payload);
-    if matched && enforcement.audit_block {
-        anyhow::bail!("udp datagram dropped: payload matched a detect rule");
-    }
+    let _matched = audit::scan_payload(&rules.borrow(), events, real_user_id, &ip, payload);
 
     // Resolve + forbidden-IP filter the destination. Without an active
     // forbidden-IP list we keep the original (host, port) send path unchanged.

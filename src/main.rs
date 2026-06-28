@@ -7,6 +7,7 @@ mod ssr;
 mod tcp;
 mod traffic;
 mod udp;
+mod user_tables;
 
 use std::path::PathBuf;
 

@@ -404,6 +404,24 @@ EOF
   fi
 }
 
+# --- 7.6 禁用 IPv6 (幂等; 后端为 ipv4_only, 关闭 IPv6 避免解析/出站歧义) -------
+# 持久化到独立 sysctl 文件，便于回滚:删此文件 + sysctl --system 即恢复。
+disable_ipv6() {
+  log "禁用 IPv6 ..."
+  local conf=/etc/sysctl.d/99-disable-ipv6.conf
+  [ -f "$conf" ] && cp -a "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
+  cat > "$conf" <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+  if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+    warn "仍有全局 IPv6 地址(异常,需排查); 配置已写入，重启后应生效。"
+  else
+    ok "IPv6 已禁用"
+  fi
+}
+
 # --- 8. 启动并校验 ---------------------------------------------------------
 start_and_verify() {
   log "启动 ${SERVICE_NAME} ..."
@@ -442,6 +460,7 @@ main() {
   install_redirect
   cap_journald
   enable_bbr
+  disable_ipv6
   start_and_verify
   echo
   ok "全部完成。"
