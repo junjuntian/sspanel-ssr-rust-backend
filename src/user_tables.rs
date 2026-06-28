@@ -19,13 +19,12 @@
 //! never holds the watch borrow across an `.await`.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use tokio::sync::watch;
 
 use crate::policy::UserPolicy;
-use crate::traffic::{RateLimiter, UserCounters};
+use crate::traffic::{RateLimiter, UserCounters, UserIpSet};
 
 /// A consistent, point-in-time view of all per-user lookup tables. Built once
 /// per poll by the supervisor and shared (behind an `Arc`) with every listener.
@@ -40,8 +39,9 @@ pub struct UserTables {
     pub auth_users: Arc<HashMap<u64, Vec<u8>>>,
     /// user_id -> traffic counter (u/d byte accumulators reported to the panel).
     pub counters_by_user: Arc<HashMap<u64, Arc<UserCounters>>>,
-    /// user_id -> live concurrent-connection counter (for conn_limit enforcement).
-    pub conns_by_user: Arc<HashMap<u64, Arc<AtomicUsize>>>,
+    /// user_id -> live set of distinct client IPs (for node_connector IP/device
+    /// cap enforcement).
+    pub conns_by_user: Arc<HashMap<u64, Arc<UserIpSet>>>,
     /// user_id -> shared per-user token bucket (node_speedlimit).
     pub speeds_by_user: Arc<HashMap<u64, Arc<RateLimiter>>>,
     /// user_id -> connection-time policy (conn_limit / forbidden ip/port). Only

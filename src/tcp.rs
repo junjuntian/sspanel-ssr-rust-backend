@@ -231,20 +231,27 @@ async fn handle_stream(
         None
     };
 
-    // node_connector: cap concurrent connections per user. The guard lives for
-    // the whole session and decrements on drop (close/error/abort).
+    // node_connector: cap the number of distinct client IPs (devices) per user,
+    // NOT raw concurrent connections — a single device's parallel connections all
+    // share one IP and count once. The guard lives for the whole session and
+    // releases the IP slot on drop (close/error/abort).
     let _conn_guard = match (&policy, context.enforcement.conn_limit) {
         (Some(policy), true) if policy.conn_limit > 0 => {
-            let counter = context
+            let set = context
                 .tables
                 .conns_by_user
                 .get(&user_id)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("no connection counter for user {user_id}"))?;
-            match ConnGuard::acquire(counter, policy.conn_limit) {
+            match ConnGuard::acquire(set, context.peer_ip.clone(), policy.conn_limit) {
                 Some(guard) => Some(guard),
                 None => {
-                    debug!(user_id, limit = policy.conn_limit, "connection limit reached; dropping");
+                    debug!(
+                        user_id,
+                        ip = %context.peer_ip,
+                        limit = policy.conn_limit,
+                        "ip/device limit reached; dropping"
+                    );
                     return Ok(());
                 }
             }

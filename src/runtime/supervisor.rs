@@ -17,12 +17,10 @@ use crate::{
     runtime::state::BoundedTtlMap,
     ssr::Profile,
     tcp::{self, TcpListenerTask},
-    traffic::{ConnLedger, RateLimiter, SpeedLedger, TrafficLedger},
+    traffic::{ConnLedger, RateLimiter, SpeedLedger, TrafficLedger, UserIpSet},
     udp::{self, UdpListenerTask},
     user_tables::{UserTables, UserTablesTx},
 };
-
-use std::sync::atomic::AtomicUsize;
 
 /// Identity of a listener's *socket-level* configuration. Only a change here
 /// forces a listener teardown + rebind. Per-user data (auth keys, policies,
@@ -228,7 +226,7 @@ impl BackendRuntime {
         let mut live_user_ids = HashSet::new();
         let mut auth_users = HashMap::new();
         let mut counters_by_user = HashMap::new();
-        let mut conns_by_user: HashMap<u64, Arc<AtomicUsize>> = HashMap::new();
+        let mut conns_by_user: HashMap<u64, Arc<UserIpSet>> = HashMap::new();
         let mut speeds_by_user: HashMap<u64, Arc<RateLimiter>> = HashMap::new();
         let mut policies: HashMap<u64, Arc<UserPolicy>> = HashMap::new();
 
@@ -408,6 +406,14 @@ impl BackendRuntime {
             })
             .collect();
         self.panel.report_alive_ips(&alive_ips).await?;
+        // Reset the alive-IP set after each successful report so the next report
+        // reflects only the IPs seen since this one — a per-cycle online-IP count,
+        // matching the original Mod_Mu semantics. Relying on the TTL alone made an
+        // IP linger up to `alive_ip_ttl_secs` (default 600s) after it went away,
+        // inflating the panel's online-IP count by roughly the TTL / report-interval
+        // ratio (~10x at defaults). Ongoing traffic re-registers an IP on its next
+        // connection (clients open fresh connections continuously).
+        self.alive_ips.retain(|_, _| false);
 
         let detect_logs: Vec<DetectLogReport> = self.detect_logs.values().cloned().collect();
         if detect_logs.is_empty() {

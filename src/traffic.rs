@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -105,16 +105,31 @@ impl TrafficLedger {
     }
 }
 
-/// Tracks the number of in-flight connections per user so the relay can enforce
-/// SSPanel's `node_connector` limit. The counters persist across panel polls (a
-/// re-sync that does not change a user must not reset their live count).
+/// The set of distinct client IPs a user currently has connections from, with a
+/// per-IP refcount so several simultaneous connections from one IP collapse to a
+/// single "device". This backs SSPanel's `node_connector` enforcement.
+#[derive(Debug, Default)]
+pub struct UserIpSet {
+    ips: Mutex<HashMap<String, usize>>,
+}
+
+/// Tracks the distinct client IPs in flight per user so the relay can enforce
+/// SSPanel's `node_connector` as a **device / IP cap** rather than a raw
+/// concurrent-connection cap. The original meaning of `node_connector` in the
+/// panel is "how many devices/IPs may a user connect from at once" — enforcing
+/// it as a concurrent-TCP-connection limit wrongly trips on a single client's
+/// parallel connections (a browser, or a 线路测速 that fans out many sockets),
+/// which manifested as spurious "线路超时". Counting distinct IPs instead means
+/// one device may open as many connections as it likes; only an additional *new*
+/// IP beyond the cap is refused. The sets persist across panel polls (a re-sync
+/// that does not change a user must not reset their live IPs).
 #[derive(Debug, Default)]
 pub struct ConnLedger {
-    state: Mutex<HashMap<u64, Arc<AtomicUsize>>>,
+    state: Mutex<HashMap<u64, Arc<UserIpSet>>>,
 }
 
 impl ConnLedger {
-    pub fn ensure_user(&self, user_id: u64) -> Arc<AtomicUsize> {
+    pub fn ensure_user(&self, user_id: u64) -> Arc<UserIpSet> {
         let mut state = self.state.lock().expect("conn ledger poisoned");
         state.entry(user_id).or_default().clone()
     }
@@ -125,29 +140,46 @@ impl ConnLedger {
     }
 }
 
-/// RAII slot for one live connection. Increments the user's counter on
-/// [`ConnGuard::acquire`] and decrements it on drop (normal close, error, or
-/// task abort), so the count cannot leak.
+/// RAII slot for one live connection from a specific client IP. On acquire it
+/// adds the IP to the user's set (or bumps its refcount); on drop it decrements
+/// and removes the IP once its last connection closes — so the distinct-IP count
+/// cannot leak across normal close, error, or task abort.
 pub struct ConnGuard {
-    counter: Arc<AtomicUsize>,
+    set: Arc<UserIpSet>,
+    ip: String,
 }
 
 impl ConnGuard {
-    /// Reserve a connection slot. Returns `None` when `limit > 0` and the user is
-    /// already at the limit (the reservation is rolled back before returning).
-    pub fn acquire(counter: Arc<AtomicUsize>, limit: u32) -> Option<Self> {
-        let prev = counter.fetch_add(1, Ordering::AcqRel);
-        if limit > 0 && prev >= limit as usize {
-            counter.fetch_sub(1, Ordering::AcqRel);
-            return None;
+    /// Reserve a slot for `ip`. An IP already present is **always** admitted (one
+    /// device may hold many connections) and only bumps its refcount. A *new* IP
+    /// is refused (returns `None`) when `limit > 0` and the user is already at
+    /// `limit` distinct IPs. `limit == 0` means unlimited.
+    pub fn acquire(set: Arc<UserIpSet>, ip: String, limit: u32) -> Option<Self> {
+        {
+            let mut ips = set.ips.lock().expect("user ip set poisoned");
+            match ips.get_mut(&ip) {
+                Some(count) => *count += 1,
+                None => {
+                    if limit > 0 && ips.len() >= limit as usize {
+                        return None;
+                    }
+                    ips.insert(ip.clone(), 1);
+                }
+            }
         }
-        Some(Self { counter })
+        Some(Self { set, ip })
     }
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        let mut ips = self.set.ips.lock().expect("user ip set poisoned");
+        if let Some(count) = ips.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                ips.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -298,6 +330,50 @@ mod tests {
         // The next 1 MiB must wait ~1s for the bucket to refill at 1 MiB/s.
         rl.acquire(1024 * 1024).await;
         assert!(start.elapsed() >= Duration::from_millis(900));
+    }
+
+    #[test]
+    fn conn_guard_counts_distinct_ips_not_connections() {
+        // node_connector enforces a DEVICE/IP cap: with limit=2, two IPs may each
+        // open arbitrarily many concurrent connections, but a third *new* IP is
+        // refused while the first two are still connected.
+        let set = Arc::new(UserIpSet::default());
+        let limit = 2;
+
+        // ip A: three concurrent connections — all admitted (one device).
+        let a1 = ConnGuard::acquire(set.clone(), "1.1.1.1".into(), limit).unwrap();
+        let a2 = ConnGuard::acquire(set.clone(), "1.1.1.1".into(), limit).unwrap();
+        let a3 = ConnGuard::acquire(set.clone(), "1.1.1.1".into(), limit).unwrap();
+        // ip B: a second device — admitted (distinct count now 2).
+        let b1 = ConnGuard::acquire(set.clone(), "2.2.2.2".into(), limit).unwrap();
+        assert_eq!(set.ips.lock().unwrap().len(), 2);
+
+        // ip C: a third device — refused (would exceed the 2-IP cap).
+        assert!(ConnGuard::acquire(set.clone(), "3.3.3.3".into(), limit).is_none());
+        // ...but an extra connection from an already-present IP is still fine.
+        let a4 = ConnGuard::acquire(set.clone(), "1.1.1.1".into(), limit).unwrap();
+
+        // Drop all of A's connections: the IP leaves the set, freeing a slot.
+        drop((a1, a2, a3, a4));
+        assert_eq!(set.ips.lock().unwrap().len(), 1, "ip A fully released");
+        // Now a new device fits again.
+        let c1 = ConnGuard::acquire(set.clone(), "3.3.3.3".into(), limit).unwrap();
+        assert_eq!(set.ips.lock().unwrap().len(), 2);
+        drop((b1, c1));
+        assert!(set.ips.lock().unwrap().is_empty(), "all released, no leak");
+    }
+
+    #[test]
+    fn conn_guard_zero_limit_is_unlimited() {
+        // limit==0 means unlimited: any number of distinct IPs is admitted but
+        // still tracked (so alive/device accounting stays correct).
+        let set = Arc::new(UserIpSet::default());
+        let g1 = ConnGuard::acquire(set.clone(), "1.1.1.1".into(), 0).unwrap();
+        let g2 = ConnGuard::acquire(set.clone(), "2.2.2.2".into(), 0).unwrap();
+        let g3 = ConnGuard::acquire(set.clone(), "3.3.3.3".into(), 0).unwrap();
+        assert_eq!(set.ips.lock().unwrap().len(), 3);
+        drop((g1, g2, g3));
+        assert!(set.ips.lock().unwrap().is_empty());
     }
 
     #[test]

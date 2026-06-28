@@ -5,7 +5,9 @@
 //! that are observable on the wire:
 //!   * `forbidden_ip`   — comma-separated IP/CIDR list the user may not reach;
 //!   * `forbidden_port` — comma-separated port / port-range list, likewise;
-//!   * `node_connector` — max concurrent TCP connections for the user (0 = off);
+//!   * `node_connector` — max distinct client IPs (devices) the user may connect
+//!     from concurrently (0 = off). Note: this is a device/IP cap, not a raw
+//!     concurrent-connection cap — one IP may hold many connections;
 //!   * `node_speedlimit`— Mbit/s rate cap (0 = off). Parsed here; the token-bucket
 //!     enforcement lives on the relay path.
 //!
@@ -135,7 +137,7 @@ impl PortRange {
 pub struct UserPolicy {
     /// Rate cap in bytes/sec. 0 = unlimited.
     pub speed_limit_bps: u64,
-    /// Max concurrent TCP connections. 0 = unlimited.
+    /// Max distinct client IPs (devices) connected at once. 0 = unlimited.
     pub conn_limit: u32,
     pub forbidden_ips: Vec<Cidr>,
     pub forbidden_ports: Vec<PortRange>,
