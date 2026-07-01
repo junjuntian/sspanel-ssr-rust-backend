@@ -404,21 +404,52 @@ EOF
   fi
 }
 
-# --- 7.6 禁用 IPv6 (幂等; 后端为 ipv4_only, 关闭 IPv6 避免解析/出站歧义) -------
-# 持久化到独立 sysctl 文件，便于回滚:删此文件 + sysctl --system 即恢复。
+# --- 7.6 禁用 IPv6 (幂等; 内核级 ipv6.disable=1, 通用/持久, 与厂商/接口名无关) --
+# 说明: 早期版本用 sysctl 软关闭(net.ipv6.conf.*.disable_ipv6=1), 但部分云厂商
+# (如 Linode Network Helper)会在开机时重写网络配置并重新收到 RA, 导致 sysctl
+# 软关闭重启后失效、IPv6 又出现。现改为写入 GRUB 内核参数 ipv6.disable=1,
+# 使 IPv6 模块从内核层面根本不加载, 与服务商/接口名/发行版无关, 重启后必定生效。
+# 幂等: 已包含则跳过写入。仅当次 GRUB 未生效时需要 reboot 才能真正生效
+# (脚本不会自动重启机器, 结束时会提示)。
+# 回滚: 恢复 /etc/default/grub.bak.<时间戳> 后 update-grub && reboot 即可。
 disable_ipv6() {
-  log "禁用 IPv6 ..."
-  local conf=/etc/sysctl.d/99-disable-ipv6.conf
-  [ -f "$conf" ] && cp -a "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
-  cat > "$conf" <<'EOF'
+  log "禁用 IPv6 (写入内核参数 ipv6.disable=1) ..."
+  local grub_file=/etc/default/grub
+  if [ ! -f "$grub_file" ]; then
+    warn "未找到 ${grub_file} (非 GRUB 引导?)，回退为 sysctl 软关闭作为兜底。"
+    local conf=/etc/sysctl.d/99-disable-ipv6.conf
+    [ -f "$conf" ] && cp -a "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
+    cat > "$conf" <<'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 EOF
-  sysctl --system >/dev/null 2>&1 || true
-  if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
-    warn "仍有全局 IPv6 地址(异常,需排查); 配置已写入，重启后应生效。"
+    sysctl --system >/dev/null 2>&1 || true
+    warn "已用 sysctl 软关闭兜底，建议人工确认该机型的正确禁用方式。"
+    return 0
+  fi
+
+  if grep -qE '^GRUB_CMDLINE_LINUX=".*ipv6\.disable=1' "$grub_file"; then
+    ok "GRUB 已包含 ipv6.disable=1，跳过写入。"
   else
-    ok "IPv6 已禁用"
+    cp -a "$grub_file" "${grub_file}.bak.$(date +%Y%m%d%H%M%S)"
+    sed -i -E 's/^(GRUB_CMDLINE_LINUX=")([^"]*)(")/\1\2 ipv6.disable=1\3/' "$grub_file"
+    sed -i -E 's/^(GRUB_CMDLINE_LINUX=") +/\1/' "$grub_file"
+    ok "已写入 GRUB_CMDLINE_LINUX += ipv6.disable=1 (备份已保留)"
+  fi
+
+  if command -v update-grub >/dev/null 2>&1; then
+    update-grub >/dev/null 2>&1 || warn "update-grub 执行有警告，请检查。"
+  elif command -v grub2-mkconfig >/dev/null 2>&1; then
+    grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1 || warn "grub2-mkconfig 执行有警告，请检查。"
+  else
+    warn "未找到 update-grub/grub2-mkconfig，请手动重新生成 grub.cfg。"
+  fi
+
+  if grep -q 'ipv6.disable=1' /proc/cmdline 2>/dev/null; then
+    ok "IPv6 已在当前运行内核生效 (cmdline 已含 ipv6.disable=1)"
+  else
+    warn "配置已写入 grub.cfg，但当前运行内核尚未生效 —— 需要 reboot 该机器才能真正禁用 IPv6。"
+    IPV6_NEEDS_REBOOT=1
   fi
 }
 
@@ -464,6 +495,11 @@ main() {
   start_and_verify
   echo
   ok "全部完成。"
+  if [ "${IPV6_NEEDS_REBOOT:-0}" = "1" ]; then
+    echo
+    warn "IPv6 禁用配置已写入 GRUB，但需要重启该机器才能真正生效 (当前仍在旧内核参数运行)。"
+    warn "请确认业务低峰后手动执行: reboot   (脚本不会自动重启)"
+  fi
 }
 
 main "$@"
